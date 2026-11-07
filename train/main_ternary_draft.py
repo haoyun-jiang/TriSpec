@@ -1,0 +1,767 @@
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--basepath', type=str, default='0')
+parser.add_argument('--configpath', type=str, default=None)
+parser.add_argument('--lr', type=float, default=3e-5)
+parser.add_argument('--bs', type=int, default=4)
+parser.add_argument('--gradient-accumulation-steps', type=int, default=1)
+parser.add_argument('--tmpdir', type=str, default='0')
+parser.add_argument('--cpdir', type=str, default=None)
+parser.add_argument('--epoch', type=int, default=40)
+parser.add_argument('--topk', type=int, default=10)
+parser.add_argument('--topk_w', type=float, default=1.0)
+parser.add_argument('--v_w', type=float, default=1.0)
+parser.add_argument('--forward_num_total', type=int, default=3)
+parser.add_argument('--ckpt_path', type=str, default=None)
+parser.add_argument('--data_num', type=int, default=68000)
+parser.add_argument('--debug', action='store_true')
+
+args = parser.parse_args()
+import shutil
+from huggingface_hub import snapshot_download
+
+# Training reads weight shards directly, so resolve a model ID to its local cache.
+model_dir = Path(args.basepath).expanduser()
+if model_dir.is_dir():
+    args.basepath = str(model_dir.resolve())
+elif model_dir.is_absolute() or args.basepath.startswith((".", "~")):
+    raise FileNotFoundError(f"Model directory does not exist: {args.basepath}")
+else:
+    args.basepath = snapshot_download(
+        args.basepath, allow_patterns=["*.json", "*.safetensors", "*.bin", "*.model", "*.txt", "*.tiktoken"]
+    )
+
+total_steps = int(args.data_num * 0.95 * (args.epoch + 1) / (args.bs * args.gradient_accumulation_steps))
+warm_steps = total_steps // 100
+
+train_config = {
+    "lr": args.lr,
+    "bs": args.bs,
+    "gradient_accumulation_steps": args.gradient_accumulation_steps,
+    "datapath": f"{args.tmpdir}",
+    "is_warmup": True,
+    "num_epochs": args.epoch,
+    # Depending on your data and model size, the larger the model, the higher the sample efficiency. We recommend setting it between 20-40.
+    "num_warmup_steps": warm_steps,
+    "total_steps": total_steps,
+    "p_w": 0.1,
+    "v_w": args.v_w,
+    "topk_w": args.topk_w,
+    "head_w": 0.1,
+    "num_workers": 2,
+    "embeding": True,
+    "act": "No",
+    "data_noise": True,
+    "noise": "uniform",
+    "mean": 0.0,
+    "std": 0.2,
+    "residual": "true,norm",
+    "max_len": 2048,
+    # During training, truncating the training sequences means that the larger the setting, the more training data is used, and the better the effect, but it also consumes more VRAM.
+    "config_path": args.configpath,
+    "b1": 0.9,
+    "b2": 0.95,
+    "grad_clip": 0.5,
+    "save_freq": 1
+}
+import json
+from safetensors import safe_open
+# from transformers import AutoModelForCausalLM, AutoTokenizer,AutoModelForSequenceClassification
+import os
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+import torch
+
+torch.backends.cuda.matmul.allow_tf32 = True
+from accelerate import Accelerator
+from accelerate.utils import set_seed
+
+set_seed(0)
+accelerator = Accelerator(mixed_precision='bf16',
+                          gradient_accumulation_steps=train_config["gradient_accumulation_steps"])
+
+from model.cnets_hass_ternary import Model
+from model.configs import EConfig
+from typing import Any, Dict, List
+
+from torch import nn, optim
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+# import accelerate
+import numpy as np
+from transformers import get_linear_schedule_with_warmup, AutoConfig
+
+if accelerator.is_main_process:
+    import swanlab
+
+    swanlab.init(project=os.environ.get("SWANLAB_PROJECT", "trispec"),
+                 experiment_name=Path(args.cpdir).name,
+                 mode=os.environ.get("TRISPEC_TRACKING", "disabled"))
+
+baseconfig = AutoConfig.from_pretrained(args.basepath)
+
+head = torch.nn.Linear(baseconfig.hidden_size, baseconfig.vocab_size, bias=False)
+
+try:
+    with open(os.path.join(args.basepath, "model.safetensors.index.json"), "r") as f:
+        index_json = json.loads(f.read())
+        head_path = index_json["weight_map"]["lm_head.weight"]
+    with safe_open(os.path.join(args.basepath, head_path),
+                   framework="pt",
+                   device="cpu") as f:
+        tensor_slice = f.get_slice("lm_head.weight")
+        vocab_size, hidden_dim = tensor_slice.get_shape()
+        tensor = tensor_slice[:, :hidden_dim].float()
+except:
+    with open(os.path.join(args.basepath, "pytorch_model.bin.index.json"), "r") as f:
+        index_json = json.loads(f.read())
+        head_path = index_json["weight_map"]["lm_head.weight"]
+    weights = torch.load(os.path.join(args.basepath, head_path))
+    tensor = weights["lm_head.weight"].float()
+
+head.weight.data = tensor
+head.eval()
+
+for param in head.parameters():
+    param.requires_grad = False
+
+
+def list_files(path):
+    datapath = []
+    for root, directories, files in os.walk(path):
+        for file in files:
+            file_path = os.path.join(root, file)
+            datapath.append(file_path)
+    return datapath
+
+
+class AddGaussianNoise:
+    def __init__(self, mean=0.0, std=0.0):
+        self.mean = mean
+        self.std = std
+
+    def __call__(self, data):
+        tensor = data["hidden_state_target"]
+        noise = torch.randn(tensor.size()) * self.std + self.mean
+        noisy_tensor = tensor + noise
+        data["hidden_state_target"] = noisy_tensor
+
+        tensor = data["hidden_state_ass"]
+        noise = torch.randn(tensor.size()) * self.std + self.mean
+        noisy_tensor = tensor + noise
+        data["hidden_state_ass"] = noisy_tensor
+        return data
+
+
+class AddUniformNoise:
+    def __init__(self, std=0.0):
+        self.std = std
+
+    def __call__(self, data):
+        tensor = data["hidden_state_target"]
+        noise = (torch.rand_like(tensor) - 0.5) * self.std * 512 / tensor.shape[1]
+        noisy_tensor = tensor + noise
+        data["hidden_state_target"] = noisy_tensor
+
+        tensor = data["hidden_state_ass"]
+        noise = (torch.rand_like(tensor) - 0.5) * self.std * 512 / tensor.shape[1]
+        noisy_tensor = tensor + noise
+        data["hidden_state_ass"] = noisy_tensor
+        return data
+
+
+class CustomDataset(Dataset):
+    def __init__(self, datapath, transform=None):
+        self.data = datapath
+        self.transform = transform
+        self.hidden_size_target = baseconfig.hidden_size
+        self.hidden_size_ass = config.ass_hidden_size
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, index):
+        # try:
+        data = torch.load(self.data[index])
+        new_data = {}
+        hidden_state_target = data['hidden_state_target'][:train_config["max_len"]][None, :]
+        hidden_state_target = hidden_state_target[:,:,:self.hidden_size_target]
+        hidden_state_ass = data['hidden_state_assistant'][:train_config["max_len"]][None, :]
+        hidden_state_ass = hidden_state_ass[:,:,:self.hidden_size_ass]
+
+        input_ids = data['input_ids'][:train_config["max_len"]][None, :]
+        loss_mask = data["loss_mask"][:train_config["max_len"]][None, :]
+
+
+        length = hidden_state_target.shape[1]
+        # length_q = data['query_ids'].shape[1]
+        attention_mask = [1] * length
+        loss_mask = loss_mask[0].tolist()
+        loss_mask[-1] = 0
+
+        input_ids_target = input_ids[:, 1:]
+        zeropadding = torch.tensor([[0]])
+        input_ids_target = torch.cat((input_ids_target, zeropadding), dim=1)
+
+        target = hidden_state_target[:, 1:, :]
+        zeropadding = torch.zeros(1, 1, target.shape[2])
+        target = torch.cat((target, zeropadding), dim=1)
+        loss_mask[-1] = 0
+        new_data["attention_mask"] = attention_mask
+        new_data["loss_mask"] = loss_mask
+        new_data["target"] = target
+        new_data["hidden_state_target"] = hidden_state_target
+        new_data["hidden_state_ass"] = hidden_state_ass
+        new_data["input_ids"] = input_ids_target
+
+
+        if self.transform:
+            new_data = self.transform(new_data)
+
+        return new_data
+
+
+class DataCollatorWithPadding:
+
+    def paddingtensor(self, intensors, N):
+        B, n, S = intensors.shape
+        # padding_tensor = torch.zeros(B, N - n, S,dtype=intensors.dtype)
+        padding_tensor = torch.zeros(B, N - n, S)
+        outtensors = torch.cat((intensors, padding_tensor), dim=1)
+        return outtensors
+
+    def paddingtensor2D(self, intensors, N):
+        B, n = intensors.shape
+        padding_tensor = torch.zeros(B, N - n, dtype=intensors.dtype)
+        outtensors = torch.cat((intensors, padding_tensor), dim=1)
+        return outtensors
+
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+        max_length = max(item['hidden_state_target'].shape[1] for item in features)
+        batch_input_ids = torch.cat([self.paddingtensor2D(item['input_ids'], max_length) for item in features])
+        batch_hidden_states_target = torch.cat([self.paddingtensor(item['hidden_state_target'], max_length) for item in features])
+        batch_hidden_states_ass = torch.cat([self.paddingtensor(item['hidden_state_ass'], max_length) for item in features])
+        batch_target = torch.cat([self.paddingtensor(item['target'], max_length) for item in features])
+        batch_loss_mask = torch.tensor(
+            [item['loss_mask'] + [0] * (max_length - len(item['loss_mask'])) for item in features])
+        batch_attention_mask = torch.tensor(
+            [item['attention_mask'] + [0] * (max_length - len(item['attention_mask'])) for item in features])
+        # batch_loss_mask = torch.ones_like(batch_loss_mask)
+        # batch_attention_mask=torch.ones_like(batch_attention_mask)
+        batch = {
+            "input_ids": batch_input_ids,
+            "hidden_states_target": batch_hidden_states_target,
+            "hidden_states_ass": batch_hidden_states_ass,
+            "target": batch_target,
+            "attention_mask": batch_attention_mask,
+            "loss_mask": batch_loss_mask,
+        }
+        return batch
+
+
+def top_accuracy(output, target, topk=(1,)):
+    # output.shape (bs, num_classes), target.shape (bs, )
+    """Computes the accuracy over the k top predictions for the specified values of k"""
+    with torch.no_grad():
+        maxk = max(topk)
+        batch_size = target.size(0)
+
+        _, pred = output.topk(maxk, 1, True, True)
+        pred = pred.t()
+        correct = pred.eq(target.view(1, -1).expand_as(pred))
+
+        res = []
+        for k in topk:
+            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
+            res.append(correct_k)
+        return res
+
+def compute_loss(target, target_p, predict, loss_mask):
+    out_head = head(predict)
+    out_logp = nn.LogSoftmax(dim=2)(out_head)
+
+    plogp = target_p * out_logp
+    ploss = -torch.sum(torch.sum(loss_mask * plogp, 2)) / (loss_mask.sum() + 1e-5)
+
+    vloss = criterion(predict, target)
+    vloss = torch.sum(torch.mean(loss_mask * vloss, 2)) / (loss_mask.sum() + 1e-5)
+
+    topk_mask = torch.topk(target_p, k=args.topk, dim=2).indices
+    topk_loss = -torch.sum(torch.sum(loss_mask * plogp.gather(dim=2, index=topk_mask), 2)) / (loss_mask.sum() + 1e-5)
+
+    return vloss, ploss, topk_loss, out_head
+
+@torch.no_grad()
+def getkacc_target(model, data, head, max_length=5):
+    def generate(hidden_states, input_ids, head, max_length=4, use_cache=True):
+        if use_cache:
+            past_key_values = None
+            for i in range(max_length):
+                if past_key_values != None:
+                    out_hidden, past_key_values = model(last_hidden, input_ids=token, past_key_values=past_key_values,
+                                                        use_cache=True)
+                else:
+                    out_hidden, past_key_values = model(hidden_states, input_ids=input_ids, use_cache=True)
+                last_hidden = out_hidden[:, -1:]
+                last_headout = head(last_hidden)
+                token = torch.argmax(last_headout, dim=-1)
+                input_ids = torch.cat((input_ids, token), dim=1)
+
+        else:
+            raise NotImplementedError
+
+        return input_ids
+
+    hidden_states = data["hidden_states_target"]
+    input_ids = data["input_ids"]
+    loss_mask = data["loss_mask"]
+    target = data["target"]
+    total = [0 for _ in range(max_length)]
+    total_alpha = [0 for _ in range(max_length)]
+    correct = [0 for _ in range(max_length)]
+    bs, seq_len = hidden_states.shape[0], hidden_states.shape[1]
+    target_headout = head(target)
+    target_ids = target_headout.argmax(dim=2)
+
+    for pre_len in range(1, seq_len):
+        if loss_mask[:, pre_len].sum() == 0:
+            continue
+        pre_hidden_states = hidden_states[:, :pre_len]
+        pre_input_ids = input_ids[:, :pre_len]
+        outs = generate(pre_hidden_states, pre_input_ids, head, max_length=max_length)
+        generate_ids = outs[:, pre_len:]
+        for bid in range(bs):
+            for k in range(max_length):
+                if loss_mask[bid, pre_len + k] == 0:
+                    break
+                if pre_len + k >= seq_len:
+                    break
+                total[k] += 1
+                total_alpha[k] += 1
+                if generate_ids[bid, k] == target_ids[bid, pre_len + k - 1]:
+                    correct[k] += 1
+                else:
+                    for kk in range(k + 1, max_length):
+                        total[kk] += 1
+                    break
+
+    acc = [correct[i] / total[i] for i in range(len(correct))]
+    for i in range(len(correct)):
+        if total_alpha[i] == 0:
+            total_alpha[i] = 1000000
+    n_alpha = [correct[i] / total_alpha[i] for i in range(len(correct))]
+    for i in range(len(n_alpha)):
+        if total_alpha[i] == 0:
+            n_alpha[i] = -1
+    return acc, n_alpha
+
+@torch.no_grad()
+def getkacc_ass(model, data, head, max_length=5):
+    def generate(hidden_states, input_ids, head, max_length=4, use_cache=True):
+        if use_cache:
+            past_key_values = None
+            for i in range(max_length):
+                if past_key_values != None:
+                    out_hidden, past_key_values = model(last_hidden, input_ids=token, past_key_values=past_key_values,
+                                                        use_cache=True)
+                else:
+                    out_hidden, past_key_values = model(hidden_states, input_ids=input_ids, use_cache=True)
+                last_hidden = out_hidden[:, -1:]
+                last_headout = head(last_hidden)
+                token = torch.argmax(last_headout, dim=-1)
+                input_ids = torch.cat((input_ids, token), dim=1)
+
+        else:
+            raise NotImplementedError
+
+        return input_ids
+
+    hidden_states = data["hidden_states_ass"]
+    input_ids = data["input_ids"]
+    loss_mask = data["loss_mask"]
+    target = data["target"]
+    total = [0 for _ in range(max_length)]
+    total_alpha = [0 for _ in range(max_length)]
+    correct = [0 for _ in range(max_length)]
+    bs, seq_len = hidden_states.shape[0], hidden_states.shape[1]
+    target_headout = head(target)
+    target_ids = target_headout.argmax(dim=2)
+
+    for pre_len in range(1, seq_len):
+        if loss_mask[:, pre_len].sum() == 0:
+            continue
+        pre_hidden_states = hidden_states[:, :pre_len]
+        pre_input_ids = input_ids[:, :pre_len]
+        outs = generate(pre_hidden_states, pre_input_ids, head, max_length=max_length)
+        generate_ids = outs[:, pre_len:]
+        for bid in range(bs):
+            for k in range(max_length):
+                if loss_mask[bid, pre_len + k] == 0:
+                    break
+                if pre_len + k >= seq_len:
+                    break
+                total[k] += 1
+                total_alpha[k] += 1
+                if generate_ids[bid, k] == target_ids[bid, pre_len + k - 1]:
+                    correct[k] += 1
+                else:
+                    for kk in range(k + 1, max_length):
+                        total[kk] += 1
+                    break
+
+    acc = [correct[i] / total[i] for i in range(len(correct))]
+    for i in range(len(correct)):
+        if total_alpha[i] == 0:
+            total_alpha[i] = 1000000
+    n_alpha = [correct[i] / total_alpha[i] for i in range(len(correct))]
+    for i in range(len(n_alpha)):
+        if total_alpha[i] == 0:
+            n_alpha[i] = -1
+    return acc, n_alpha
+
+
+if train_config["data_noise"]:
+    if train_config["noise"] == "uniform":
+        aug = AddUniformNoise(std=train_config["std"])
+    else:
+        aug = AddGaussianNoise(mean=train_config["mean"], std=train_config["std"])
+else:
+    aug = None
+
+datapath = list_files(train_config["datapath"])
+
+traindatapath = datapath[:int(len(datapath) * 0.95)]
+testdatapath = datapath[int(len(datapath) * 0.95):]
+
+config = EConfig.from_pretrained(train_config["config_path"])
+
+traindataset = CustomDataset(traindatapath, transform=aug)
+testdataset = CustomDataset(testdatapath)
+train_loader = DataLoader(traindataset, batch_size=train_config["bs"], shuffle=True,
+                          collate_fn=DataCollatorWithPadding(), num_workers=train_config["num_workers"],
+                          pin_memory=True)
+test_loader = DataLoader(testdataset, batch_size=train_config["bs"], shuffle=False,
+                         collate_fn=DataCollatorWithPadding(), num_workers=train_config["num_workers"], pin_memory=True)
+
+if accelerator.is_main_process:
+    if not os.path.exists(args.cpdir):
+        os.makedirs(args.cpdir)
+
+model = Model(config, load_emb=True, path=args.basepath)
+
+
+if args.ckpt_path is not None: 
+    ea_model_path = args.ckpt_path
+    load_model_path=os.path.join(ea_model_path, "pytorch_model.bin")
+    if os.path.exists(load_model_path):
+        ea_layer_state_dict = torch.load(load_model_path, map_location="cuda")
+    else:
+        load_model_path = os.path.join(ea_model_path, "model.safetensors")
+        ea_layer_state_dict = safetensors.torch.load_file(load_model_path)
+    model.load_state_dict(ea_layer_state_dict, strict=True)
+    print(f"load model from {load_model_path}")
+
+
+
+criterion = nn.SmoothL1Loss(reduction="none")
+optimizer = optim.AdamW(model.parameters(), lr=train_config["lr"], betas=(train_config["b1"], train_config["b2"]))
+
+num_epochs = train_config["num_epochs"]
+num_warmup_steps = train_config["num_warmup_steps"]
+total_steps = train_config["total_steps"]
+is_warmup = train_config["is_warmup"]
+
+if is_warmup:
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=num_warmup_steps,
+                                                num_training_steps=total_steps)
+
+    model, head, optimizer, train_loader, test_loader, scheduler = accelerator.prepare(
+        model, head, optimizer, train_loader, test_loader, scheduler
+    )
+else:
+    model, head, optimizer, train_loader, test_loader = accelerator.prepare(
+        model, head, optimizer, train_loader, test_loader
+    )
+
+
+for epoch in range(num_epochs + 1):
+    top_3acc = [0 for _ in range(3)]
+    top_3acc_ass = [0 for _ in range(3)]
+    correct = 0
+    correct_ass = 0
+    total = 0
+    epoch_loss = 0
+    num_batches = 0
+    model.train()
+    for batch_idx, data in enumerate(tqdm(train_loader)):
+
+        if args.debug and batch_idx > 10:
+            break
+
+        with accelerator.accumulate(model):
+            optimizer.zero_grad()
+            hidden_states_target,hidden_states_ass, input_ids, attention_mask, target, loss_mask = data["hidden_states_target"],data["hidden_states_ass"], data["input_ids"], data["attention_mask"], data["target"], data["loss_mask"][..., None]
+            loss = 0
+            with torch.no_grad():
+                target_head = head(target)
+                target_p = nn.Softmax(dim=2)(target_head)
+                target_p = target_p.detach()
+
+            q_hidden_states = None
+            for forward_idx in range(args.forward_num_total):
+                if hasattr(model, 'module'):
+                    predict = model.module(hidden_states_target, input_ids, attention_mask, q_hidden_states=q_hidden_states)
+                else:
+                    predict = model(hidden_states_target, input_ids, attention_mask, q_hidden_states=q_hidden_states)
+                # predict = model(hidden_states, input_ids, attention_mask, q_hidden_states=q_hidden_states)
+
+                if q_hidden_states is None:
+                    q_hidden_states = torch.cat([hidden_states_target[:, :1, :], predict[:, :-1, :]], dim=1)[None, :, :, :]
+                else:
+                    new_q_hidden_states = torch.cat([q_hidden_states[-1][:, :1, :], predict[:, :-1, :]], dim=1)[None, :, :, :]
+                    q_hidden_states = torch.cat([q_hidden_states, new_q_hidden_states], dim=0)
+                q_hidden_states = q_hidden_states.detach()
+
+                vloss, ploss, topk_loss, out_head = compute_loss(target, target_p, predict, loss_mask)
+                total_loss = train_config["v_w"] * vloss + train_config["p_w"] * ploss + train_config["topk_w"] * topk_loss
+                loss += total_loss
+                accelerator.backward(total_loss)
+
+            q_hidden_states_ass = None
+            for forward_idx in range(args.forward_num_total):
+                if hasattr(model, 'module'):
+                    hidden_states_ass = model.module.adapter(data["hidden_states_ass"])
+                    predict = model.module(hidden_states_ass, input_ids, attention_mask, q_hidden_states=q_hidden_states_ass)
+                else:
+                    hidden_states_ass = model.adapter(data["hidden_states_ass"])
+                    predict = model(hidden_states_ass, input_ids, attention_mask, q_hidden_states=q_hidden_states_ass)
+
+                if q_hidden_states_ass is None:
+                    q_hidden_states_ass = torch.cat([hidden_states_ass[:, :1, :], predict[:, :-1, :]], dim=1)[None, :, :, :]
+                else:
+                    new_q_hidden_states_ass = torch.cat([q_hidden_states_ass[-1][:, :1, :], predict[:, :-1, :]], dim=1)[None, :, :, :]
+                    q_hidden_states_ass = torch.cat([q_hidden_states_ass, new_q_hidden_states_ass], dim=0)
+                q_hidden_states_ass = q_hidden_states_ass.detach()
+
+                vloss_ass, ploss_ass, topk_loss_ass, out_head_ass = compute_loss(target, target_p, predict, loss_mask)
+                total_loss_ass = train_config["v_w"] * vloss_ass + train_config["p_w"] * ploss_ass + train_config["topk_w"] * topk_loss_ass
+                loss += total_loss_ass
+                accelerator.backward(total_loss_ass)
+
+            accelerator.clip_grad_value_(model.parameters(), train_config["grad_clip"])
+            optimizer.step()
+            optimizer.zero_grad()
+            loss /= (2 * args.forward_num_total)
+            if is_warmup:
+                scheduler.step()
+
+        with torch.no_grad():
+            _, predicted = torch.max(out_head, 2)
+            _, predicted_ass = torch.max(out_head_ass, 2)
+            _, target = torch.max(target_head, 2)
+            ct = loss_mask.sum().item()
+            cc = ((predicted == target) * loss_mask.squeeze()).sum().item()
+            cc_ass = ((predicted_ass == target) * loss_mask.squeeze()).sum().item()
+            out_head = out_head.view(-1, target_head.shape[-1])[loss_mask.view(-1) == 1]
+            out_head_ass = out_head_ass.view(-1, target_head.shape[-1])[loss_mask.view(-1) == 1]
+            target = target.view(-1)[loss_mask.view(-1) == 1]
+            topkacc = top_accuracy(out_head, target, (1, 2, 3))
+            topkacc_ass = top_accuracy(out_head_ass, target, (1, 2, 3))
+            for top_i in range(len(topkacc)):
+                top_3acc[top_i] += topkacc[top_i]
+                top_3acc_ass[top_i] += topkacc_ass[top_i]
+            total += ct
+            correct += cc
+            correct_ass += cc_ass
+        if accelerator.is_main_process and ct != 0:
+            logdict = {"train/lr": optimizer.optimizer.param_groups[0]["lr"], "train/vloss": vloss.item(), "train/vloss_ass": vloss_ass.item(),
+                       "train/ploss": ploss.item(), "train/ploss_ass": ploss_ass.item(), "train/topkloss": topk_loss.item(),"train/topkloss_ass": topk_loss_ass.item(), "train/loss": loss.item(), "train/acc": cc / ct,"train/acc_ass": cc_ass / ct}
+            for id, i in enumerate(top_3acc):
+                logdict[f'train/top_{id + 1}_acc'] = topkacc[id].item() / ct
+                logdict[f'train/top_{id + 1}_acc_ass'] = topkacc_ass[id].item() / ct
+            swanlab.log(logdict)
+
+        del ploss, vloss, ploss_ass, vloss_ass
+        epoch_loss += loss.item()
+        num_batches += 1
+
+    correct, correct_ass, total = torch.tensor(correct).cuda(),torch.tensor(correct_ass).cuda(), torch.tensor(total).cuda()
+    correct_target, total_target = accelerator.gather_for_metrics((correct, total))
+    correct_ass, total_ass = accelerator.gather_for_metrics((correct_ass, total))
+    correct, total = correct_target.sum().item(), total_target.sum().item()
+    correct_ass, total_ass = correct_ass.sum().item(), total_ass.sum().item()
+    epoch_loss /= num_batches
+    top_3acc = accelerator.gather_for_metrics(top_3acc)
+    top_3acc_ass = accelerator.gather_for_metrics(top_3acc_ass)
+    if accelerator.is_local_main_process:
+        for id, i in enumerate(top_3acc):
+            swanlab.log({f'train/epochtop_{id + 1}_acc': i.sum().item() / total})
+        for id, i in enumerate(top_3acc_ass):
+            swanlab.log({f'train/epochtop_{id + 1}_acc_ass': i.sum().item() / total})
+    if accelerator.is_local_main_process:
+        print('Epoch [{}/{}], Loss: {:.4f}'.format(epoch + 1, num_epochs, epoch_loss))
+        print('Train Accuracy: {:.2f}%'.format(100 * correct / total))
+        print('Train Accuracy Ass: {:.2f}%'.format(100 * correct_ass / total))
+        swanlab.log({"train/epochacc": correct / total, "train/epochacc_ass": correct_ass / total, "train/epochloss": epoch_loss})
+
+    if (epoch + 1) % train_config["save_freq"] == 0:
+        top_3acc = [0 for _ in range(3)]
+        top_3acc_ass = [0 for _ in range(3)]
+        correct = 0
+        correct_ass = 0
+        total = 0
+        epoch_loss = 0
+        epoch_loss_ass = 0
+        num_batches = 0
+
+        model.eval()
+
+        k_acc = [[] for i in range(5)]
+        k_n_alpha = [[] for i in range(5)]
+
+        k_acc_ass = [[] for i in range(5)]
+        k_n_alpha_ass = [[] for i in range(5)]
+
+        for batch_idx, data in enumerate(tqdm(test_loader)):
+
+            if args.debug and batch_idx > 10:
+                break
+
+            with torch.no_grad():
+                if batch_idx < 2: 
+                    acces, n_alpha = getkacc_target(model, data, head, max_length=5)
+                    for i in range(len(acces)):
+                        k_acc[i].append(acces[i])
+                        if n_alpha[i] != -1: # exclude the case that total_alpha is 0
+                            k_n_alpha[i].append(n_alpha[i])
+                    
+                    acces_ass, n_alpha_ass = getkacc_ass(model, data, head, max_length=5)
+                    for i in range(len(acces_ass)):
+                        k_acc_ass[i].append(acces_ass[i])
+                        if n_alpha_ass[i] != -1: # exclude the case that total_alpha is 0
+                            k_n_alpha_ass[i].append(n_alpha[i])
+                
+                target_head = head(data["target"])
+                target_p = nn.Softmax(dim=2)(target_head)
+                target_p = target_p.detach()
+
+                loss_mask = data["loss_mask"][:, :, None]
+                
+                q_hidden_states = None
+                for forward_idx in range(args.forward_num_total):
+                    if hasattr(model, 'module'):
+                        predict = model.module(data["hidden_states_target"], input_ids=data["input_ids"], attention_mask=data["attention_mask"], q_hidden_states=q_hidden_states)
+                    else:
+                        predict = model(data["hidden_states_target"], input_ids=data["input_ids"], attention_mask=data["attention_mask"], q_hidden_states=q_hidden_states)
+
+                    if q_hidden_states is None:
+                        q_hidden_states = torch.cat([data["hidden_states_target"][:, :1, :], predict[:, :-1, :]], dim=1)[None, :, :, :]
+                    else:
+                        new_q_hidden_states = torch.cat([q_hidden_states[-1][:, :1, :], predict[:, :-1, :]], dim=1)[None, :, :, :]
+                        q_hidden_states = torch.cat([q_hidden_states, new_q_hidden_states], dim=0)
+
+                vloss, ploss, topk_loss, out_head = compute_loss(data["target"], target_p, predict, loss_mask)
+                loss = train_config["v_w"] * vloss + train_config["p_w"] * ploss + train_config["topk_w"] * topk_loss
+
+                q_hidden_states_ass = None
+                for forward_idx in range(args.forward_num_total):
+                    if hasattr(model, 'module'):
+                        hidden_states_ass = model.module.adapter(data["hidden_states_ass"])
+                        predict = model.module(hidden_states_ass, input_ids=data["input_ids"], attention_mask=data["attention_mask"], q_hidden_states=q_hidden_states)
+                    else:
+                        hidden_states_ass = model.adapter(data["hidden_states_ass"])
+                        predict = model(hidden_states_ass, input_ids=data["input_ids"], attention_mask=data["attention_mask"], q_hidden_states=q_hidden_states)
+
+                    if q_hidden_states_ass is None:
+                        q_hidden_states_ass = torch.cat([hidden_states_ass[:, :1, :], predict[:, :-1, :]], dim=1)[None, :, :, :]
+                    else:
+                        new_q_hidden_states_ass = torch.cat([q_hidden_states_ass[-1][:, :1, :], predict[:, :-1, :]], dim=1)[None, :, :, :]
+                        q_hidden_states_ass = torch.cat([q_hidden_states_ass, new_q_hidden_states_ass], dim=0)
+
+                vloss_ass, ploss_ass, topk_loss_ass, out_head_ass = compute_loss(data["target"], target_p, predict, loss_mask)
+                loss_ass = train_config["v_w"] * vloss_ass + train_config["p_w"] * ploss_ass + train_config["topk_w"] * topk_loss_ass
+
+                _, predicted = torch.max(out_head, 2)
+                _, predicted_ass = torch.max(out_head_ass, 2)
+                _, target = torch.max(target_head, 2)
+                ct = loss_mask.sum().item()
+                cc = ((predicted == target) * loss_mask.squeeze()).sum().item()
+                cc_ass = ((predicted_ass == target) * loss_mask.squeeze()).sum().item()
+                out_head = out_head.view(-1, target_head.shape[-1])[loss_mask.view(-1) == 1]
+                out_head_ass = out_head_ass.view(-1, target_head.shape[-1])[loss_mask.view(-1) == 1]
+                target = target.view(-1)[loss_mask.view(-1) == 1]
+                topkacc = top_accuracy(out_head, target, (1, 2, 3))
+                topkacc_ass = top_accuracy(out_head_ass, target, (1, 2, 3))
+                for top_i in range(len(topkacc)):
+                    top_3acc[top_i] += topkacc[top_i]
+                    top_3acc_ass[top_i] += topkacc_ass[top_i]
+                total += ct
+                correct += cc
+                correct_ass += cc_ass
+            epoch_loss += (loss.item() + loss_ass.item()) /2
+            num_batches += 1
+
+        mean_acces = []
+        mean_n_alphas = []
+        for id, i in enumerate(k_acc):
+            mean_acc = np.array(i).mean()
+            mean_acc = torch.tensor(mean_acc).cuda()
+            mean_acces.append(mean_acc)
+        for id, i in enumerate(k_n_alpha):
+            mean_n_alpha = np.array(i).mean()
+            mean_n_alpha = torch.tensor(mean_n_alpha).cuda()
+            mean_n_alphas.append(mean_n_alpha)
+
+        mean_acces = accelerator.gather_for_metrics(mean_acces)
+        if accelerator.is_local_main_process:
+            for id, i in enumerate(mean_acces):
+                mean_acc = i.mean().item()
+                swanlab.log({f"test/{id}_acc": mean_acc})
+            for id, i in enumerate(mean_n_alphas):
+                mean_n_alpha = i.mean().item()
+                swanlab.log({f"test/{id}_n_alpha": mean_n_alpha})
+
+        mean_acces_ass = []
+        mean_n_alphas_ass = []
+        for id, i in enumerate(k_acc_ass):
+            mean_acc_ass = np.array(i).mean()
+            mean_acc_ass = torch.tensor(mean_acc_ass).cuda()
+            mean_acces_ass.append(mean_acc_ass)
+        for id, i in enumerate(k_n_alpha_ass):
+            mean_n_alpha_ass = np.array(i).mean()
+            mean_n_alpha_ass = torch.tensor(mean_n_alpha_ass).cuda()
+            mean_n_alphas_ass.append(mean_n_alpha_ass)
+
+        mean_acces_ass = accelerator.gather_for_metrics(mean_acces_ass)
+        if accelerator.is_local_main_process:
+            for id, i in enumerate(mean_acces_ass):
+                mean_acc_ass = i.mean().item()
+                swanlab.log({f"test/{id}_acc_ass": mean_acc_ass})
+            for id, i in enumerate(mean_n_alphas_ass):
+                mean_n_alpha_ass = i.mean().item()
+                swanlab.log({f"test/{id}_n_alpha_ass": mean_n_alpha_ass})
+
+        correct, correct_ass, total = torch.tensor(correct).cuda(),torch.tensor(correct_ass).cuda(), torch.tensor(total).cuda()
+        correct_target, total_target = accelerator.gather_for_metrics((correct, total))
+        correct_ass, total_ass = accelerator.gather_for_metrics((correct_ass, total))
+        correct, total = correct_target.sum().item(), total_target.sum().item()
+        correct_ass, total_ass = correct_ass.sum().item(), total_ass.sum().item()
+        epoch_loss /= num_batches
+        top_3acc = accelerator.gather_for_metrics(top_3acc)
+        top_3acc_ass = accelerator.gather_for_metrics(top_3acc_ass)
+        if accelerator.is_local_main_process:
+            for id, i in enumerate(top_3acc):
+                swanlab.log({f'test/top_{id + 1}_acc': i.sum().item() / total})
+            for id, i in enumerate(top_3acc_ass):
+                swanlab.log({f'test/top_{id + 1}_acc_ass': i.sum().item() / total})
+
+        if accelerator.is_local_main_process:
+            print('Test Epoch [{}/{}], Loss: {:.4f}'.format(epoch + 1, num_epochs, epoch_loss))
+            print('Test Accuracy: {:.2f}%'.format(100 * correct / total))
+            print('Test Accuracy Ass: {:.2f}%'.format(100 * correct_ass / total))
+            swanlab.log({"test/epochacc": correct / total, "test/epochacc_ass": correct_ass / total, "test/epochloss": epoch_loss})
+            accelerator.save_state(output_dir=f"{args.cpdir}/state_{epoch}")
+            shutil.copyfile(args.configpath, Path(f"{args.cpdir}/state_{epoch}") / "config.json")

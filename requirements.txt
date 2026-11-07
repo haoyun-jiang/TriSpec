@@ -1,0 +1,27 @@
+# Dependencies for training, data preparation, and evaluation.
+torch==2.6.0
+transformers==4.51.1
+accelerate==1.6.0
+huggingface-hub>=0.30,<1
+safetensors>=0.5,<1
+numpy>=1.26,<3
+tqdm>=4.66,<5
+shortuuid>=1,<2
+regex
+sympy==1.13.1
+latex2sympy2==1.9.1
+word2number==1.1
+scikit-learn>=1.5,<2
+pandas>=2,<3
+fire>=0.7,<1
+sentencepiece>=0.2,<1
+protobuf>=3.20
+requests>=2.32,<3
+pyarrow>=19,<21
+datasets==3.6.0
+deepspeed>=0.16,<0.17
+ninja
+packaging
+# EAGLE-3 training additionally requires flash-attn, installed after CUDA PyTorch.
+# Run the vLLM server in a separate environment (vllm==0.8.5).
+swanlab==0.6.0
